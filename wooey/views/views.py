@@ -1,25 +1,20 @@
 from __future__ import absolute_import, unicode_literals
 from collections import defaultdict
-import datetime as dt
 
-from django.views.generic import DetailView, TemplateView, View
-from django.template.loader import render_to_string
-from django.http import HttpResponse, HttpResponseRedirect
-from django.core.urlresolvers import reverse
-from django.conf import settings
-from django.forms import FileField
-from django.utils.translation import ugettext_lazy as _
-from django.utils.encoding import force_text
-from django.template import RequestContext
 from django.contrib.auth import get_user_model
-from django.http import Http404
-
 from django.contrib.contenttypes.models import ContentType
+from django.forms import FileField
+from django.http import JsonResponse
+from django.template import RequestContext
+from django.template.loader import render_to_string
+from django.utils.encoding import force_text
+from django.utils.translation import ugettext_lazy as _
+from django.views.generic import DetailView, TemplateView, View
 
 from ..backend import utils
+from ..django_compat import reverse
 from ..models import WooeyJob, Script, UserFile, Favorite, ScriptVersion
 from .. import settings as wooey_settings
-from ..django_compat import JsonResponse
 
 
 class WooeyScriptBase(DetailView):
@@ -31,39 +26,10 @@ class WooeyScriptBase(DetailView):
     def render_fn(s):
         return s
 
-    def get_object(self, queryset=None):
-        script_version = self.kwargs.get('script_verison')
-        script_iteration = self.kwargs.get('script_iteration')
-        if script_version is not None:
-            if queryset is None:
-                queryset = self.get_queryset()
-
-            slug = self.kwargs.get(self.slug_url_kwarg, None)
-
-            # Next, try looking up by slug.
-            if slug is not None:
-                slug_field = self.get_slug_field()
-                queryset = queryset.filter(**{slug_field: slug, 'script_version': script_version})
-                if script_iteration:
-                    queryset.filter(script_iteration=script_iteration)
-                else:
-                    queryset.latest('script_iteration')
-            else:
-                raise AttributeError("Generic detail view %s must be called with "
-                                     "either an object pk or a slug."
-                                     % self.__class__.__name__)
-            try:
-                # Get the single item from the filtered queryset
-                obj = queryset.get()
-            except queryset.model.DoesNotExist:
-                raise Http404(_("No %(verbose_name)s found matching the query") %
-                              {'verbose_name': queryset.model._meta.verbose_name})
-            return obj
-        else:
-            return super(WooeyScriptBase, self).get_object(queryset=queryset)
-
     def get_context_data(self, **kwargs):
         context = super(WooeyScriptBase, self).get_context_data(**kwargs)
+        version = self.kwargs.get('script_version')
+        iteration = self.kwargs.get('script_iteration')
 
         # returns the models required and optional fields as html
         job_id = self.kwargs.get('job_id')
@@ -71,24 +37,48 @@ class WooeyScriptBase(DetailView):
 
         if job_id:
             job = WooeyJob.objects.get(pk=job_id)
-            if job.user is None or (self.request.user.is_authenticated() and job.user == self.request.user):
-                context['job_info'] = {'job_id': job_id, 'url': job.get_resubmit_url(), 'data_url': job.script_version.script.get_url()}
+            if job.user is None or (self.request.user.is_authenticated and job.user == self.request.user):
+                context['job_info'] = {'job_id': job_id}
 
+                parser_used = None
                 for i in job.get_parameters():
                     value = i.value
                     if value is not None:
-                        initial[i.parameter.slug].append(value)
+                        script_parameter = i.parameter
+                        if script_parameter.parser.name:
+                            parser_used = script_parameter.parser.pk
+                        initial[script_parameter.form_slug].append(value)
 
-        context['form'] = utils.get_form_groups(script_version=self.object.latest_version, initial_dict=initial, render_fn=self.render_fn, pk=self.object.pk)
+                if parser_used is not None:
+                    initial['wooey_parser'] = parser_used
+
+        script_version = ScriptVersion.objects.filter(
+            script=self.object,
+        )
+        if not (version or iteration):
+            script_version = script_version.get(default_version=True)
+        else:
+            if version:
+                script_version = script_version.filter(script_version=version)
+            if iteration:
+                script_version = script_version.filter(script_iteration=iteration)
+
+            script_version = script_version.order_by('script_version', 'script_iteration').last()
+
+        context['form'] = utils.get_form_groups(
+            script_version=script_version,
+            initial_dict=initial,
+            render_fn=self.render_fn,
+        )
         return context
 
     def post(self, request, *args, **kwargs):
         post = request.POST.copy()
-        user = request.user if request.user.is_authenticated() else None
+        user = request.user if request.user.is_authenticated else None
         if not wooey_settings.WOOEY_ALLOW_ANONYMOUS and user is None:
             return {'valid': False, 'errors': {'__all__': [force_text(_('You are not permitted to access this script.'))]}}
 
-        form = utils.get_master_form(pk=post['wooey_type'])
+        form = utils.get_master_form(pk=int(post['wooey_type']), parser=int(post.get('wooey_parser', 0)))
         # TODO: Check with people who know more if there's a smarter way to do this
         utils.validate_form(form=form, data=post, files=request.FILES)
         # for cloned jobs, we don't have the files in input fields, they'll be in a list like ['', filename]
@@ -120,14 +110,19 @@ class WooeyScriptBase(DetailView):
                 form.cleaned_data[i] = list(set(cleaned).union(set(v)))
 
         if not form.errors:
-            # data = form.cleaned_data
             version_pk = form.cleaned_data.get('wooey_type')
+            parser_pk = form.cleaned_data.get('wooey_parser')
             script_version = ScriptVersion.objects.get(pk=version_pk)
             valid = utils.valid_user(script_version.script, request.user).get('valid')
             if valid == True:
                 group_valid = utils.valid_user(script_version.script.script_group, request.user).get('valid')
                 if valid == True and group_valid == True:
-                    job = utils.create_wooey_job(script_version_pk=version_pk, user=user, data=form.cleaned_data)
+                    job = utils.create_wooey_job(
+                        script_parser_pk=parser_pk,
+                        script_version_pk=version_pk,
+                        user=user,
+                        data=form.cleaned_data
+                    )
                     job.submit_to_celery()
                     return {'valid': True, 'job_id': job.id}
 
@@ -172,7 +167,7 @@ class WooeyHomeView(TemplateView):
         ctx['scripts'] = utils.get_current_scripts()
 
         # Check for logged in user
-        if self.request.user.is_authenticated():
+        if self.request.user.is_authenticated:
             # Get the id of every favorite (scrapbook) file
             ctype = ContentType.objects.get_for_model(Script)
             ctx['favorite_script_ids'] = Favorite.objects.filter(content_type=ctype, user__id=self.request.user.id).values_list('object_id', flat=True)
@@ -193,7 +188,7 @@ class WooeyProfileView(TemplateView):
             ctx['profile_user'] = user.objects.get(username=self.kwargs.get('username'))
 
         else:
-            if self.request.user and self.request.user.is_authenticated():
+            if self.request.user and self.request.user.is_authenticated:
                 ctx['profile_user'] = self.request.user
 
         return ctx

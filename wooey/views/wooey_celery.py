@@ -1,25 +1,22 @@
 from __future__ import absolute_import
 import six
 
-from django.core.urlresolvers import reverse
-from django.views.generic import DetailView, TemplateView
-from django.utils.translation import ugettext_lazy as _
-from django.utils.encoding import force_text
-from django.template.defaultfilters import escape
-
 from celery import app, states
-
-celery_app = app.app_or_default()
-
 from django.contrib.contenttypes.models import ContentType
+from django.db.models import Q
+from django.http import JsonResponse
+from django.template.defaultfilters import escape
+from django.template.loader import render_to_string
+from django.utils.encoding import force_text
+from django.utils.translation import ugettext_lazy as _
+from django.views.generic import DetailView, ListView
 
+from ..django_compat import reverse
 from ..models import WooeyJob, UserFile, Favorite
 from .. import settings as wooey_settings
 from ..backend.utils import valid_user, get_file_previews
-from ..django_compat import JsonResponse
-from django.db.models import Q
-from django.views.generic import ListView
-from django.template.loader import render_to_string
+
+celery_app = app.app_or_default()
 
 SPANBASE = "<span title='{}' class='glyphicon {}'></span> "
 MAXIMUM_JOBS_NAVBAR = 10
@@ -63,22 +60,28 @@ def global_queue_json(request):
     return JsonResponse(generate_job_list(jobs), safe=False)
 
 
-def get_user_queue(request):
+def get_active_user_jobs(request):
     user = request.user
-    jobs = WooeyJob.objects.filter(Q(user=None) | Q(user=user) if request.user.is_authenticated() else Q(user=None))
-    jobs = jobs.exclude(Q(status=WooeyJob.DELETED) | Q(status=WooeyJob.COMPLETED))
+    jobs = WooeyJob.objects.filter(
+        (Q(user=None) | Q(user=user) if request.user.is_authenticated else Q(user=None)) &
+        (Q(status=WooeyJob.RUNNING))
+    )
     return jobs.order_by('-created_date')
 
 
 def user_queue_json(request):
-    jobs = get_user_queue(request)
+    jobs = get_active_user_jobs(request)
     return JsonResponse(generate_job_list(jobs), safe=False)
 
 
 def get_user_results(request):
     user = request.user
-    jobs = WooeyJob.objects.filter(Q(status=WooeyJob.COMPLETED) & (Q(user=None) | Q(user=user) if request.user.is_authenticated() else Q(user=None)))
-    jobs = jobs.exclude(status=WooeyJob.DELETED)
+    jobs = WooeyJob.objects.filter((Q(user=None) | Q(user=user) if request.user.is_authenticated else Q(user=None)))
+    jobs = jobs.exclude(
+        Q(status=WooeyJob.RUNNING) |
+        Q(status=WooeyJob.SUBMITTED) |
+        Q(status=WooeyJob.DELETED)
+    )
     return jobs.order_by('-created_date')
 
 
@@ -90,7 +93,7 @@ def user_results_json(request):
 def all_queues_json(request):
 
     global_queue = get_global_queue(request)
-    user_queue = get_user_queue(request)
+    user_queue = get_active_user_jobs(request)
     user_results = get_user_results(request)
 
     return JsonResponse({
@@ -115,7 +118,7 @@ def celery_task_command(request):
     response = {'valid': False, }
     valid = valid_user(job.script_version.script, request.user)
     if valid.get('valid') == True:
-        user = request.user if request.user.is_authenticated() else None
+        user = request.user if request.user.is_authenticated else None
         if user == job.user or job.user == None:
             if command == 'resubmit':
                 new_job = job.submit_to_celery(resubmit=True, user=request.user)
@@ -123,8 +126,6 @@ def celery_task_command(request):
             elif command == 'rerun':
                 job.submit_to_celery(user=request.user, rerun=True)
                 response.update({'valid': True, 'redirect': reverse('wooey:celery_results', kwargs={'job_id': job_id})})
-            elif command == 'clone':
-                response.update({'valid': True, 'redirect': reverse('wooey:wooey_script_clone', kwargs={'slug': job.script_version.script.slug, 'job_id': job_id})})
             elif command == 'delete':
                 job.status = WooeyJob.DELETED
                 job.save()
@@ -161,7 +162,7 @@ class JobBase(DetailView):
         wooey_job = ctx['wooeyjob']
 
         user = self.request.user
-        user = None if not user.is_authenticated() and wooey_settings.WOOEY_ALLOW_ANONYMOUS else user
+        user = None if not user.is_authenticated and wooey_settings.WOOEY_ALLOW_ANONYMOUS else user
         job_user = wooey_job.user
         if job_user is None or job_user == user or \
                 (user is not None and user.is_superuser) or \
@@ -177,20 +178,19 @@ class JobBase(DetailView):
                                                         user=user).values_list('object_id', flat=True)
 
             ctx['job_info'] = {
-                    'all_files': all,
-                    'archives': archives,
-                    'file_groups': out_files,
-                    'status': wooey_job.status,
-                    'last_modified': wooey_job.modified_date,
-                    'job': wooey_job,
-
-                }
+                'all_files': all,
+                'archives': archives,
+                'file_groups': out_files,
+                'status': wooey_job.status,
+                'last_modified': wooey_job.modified_date,
+                'job': wooey_job,
+            }
 
             ctx['favorite_file_ids'] = favorite_file_ids
 
 
         else:
-            ctx['job_error'] = _('You are not authenticated to view this job.')
+            ctx['job_error'] = WooeyJob.error_messages['invalid_permissions']
         return ctx
 
 
@@ -273,13 +273,13 @@ class UserQueueView(JobListBase):
     title = "My Queue"
 
     def get_queryset(self, *args, **kwargs):
-        return get_user_queue(self.request)
+        return get_active_user_jobs(self.request)
 
 
 class UserResultsView(JobListBase):
 
     def get_context_data(self, **kwargs):
-        if self.request.user and self.request.user.is_authenticated():
+        if self.request.user and self.request.user.is_authenticated:
             kwargs['title'] = "My Results"
         else:
             kwargs['title'] = "Public Results"

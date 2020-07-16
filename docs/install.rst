@@ -5,7 +5,7 @@ Installation
 
     pip install wooey
 
-Currently, Wooey supports Django versions 1.8+. To use Wooey in a project which is still running Django 1.6 or 1.7, you must may install
+Currently, Wooey supports Django versions 1.8+. To use Wooey in a project which is still running Django 1.6 or 1.7, you must install
 version 0.9.8.
 
 A Wooey only project
@@ -34,10 +34,7 @@ Installation with existing Django Projects
         you can have r'^wooey/'... as your router):
        
     3. Migrate your database:
-        # Django 1.6 and below:
-        ./manage.py syncdb
-        
-        # Django 1.7 and above
+        # Django 1.8 and above
         ./manage.py makemigrations
         ./manage.py migrate
         

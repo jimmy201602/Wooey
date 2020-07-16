@@ -35,23 +35,37 @@ class FileCleanupMixin(object):
                     print('unable to delete {}'.format(path))
         super(FileCleanupMixin, self).tearDown()
 
-
-class ScriptFactoryMixin(object):
+class ScriptTearDown(object):
     def tearDown(self):
         for i in ScriptVersion.objects.all():
-            path = i.script_path.name
-            # import pdb; pdb.set_trace();
-            utils.get_storage().delete(path)
+            name = i.script_path.name
+            utils.get_storage().delete(name)
             if wooey_settings.WOOEY_EPHEMERAL_FILES:
-                utils.get_storage(local=False).delete(path)
-            path += 'c'  # handle pyc junk
-            utils.get_storage().delete(path)
-        super(ScriptFactoryMixin, self).tearDown()
+                try:
+                    utils.get_storage(local=False).delete(name)
+                except WindowsError:
+                    print('unable to delete {}'.format(name))
+            name += 'c'  # handle pyc junk
+            try:
+                utils.get_storage().delete(name)
+            except WindowsError:
+                print('unable to delete {}'.format(name))
+        super(ScriptTearDown, self).tearDown()
 
+class ScriptFactoryMixin(ScriptTearDown, object):
     def setUp(self):
         self.translate_script = factories.generate_script(os.path.join(config.WOOEY_TEST_SCRIPTS, 'translate.py'))
         self.choice_script = factories.generate_script(os.path.join(config.WOOEY_TEST_SCRIPTS, 'choices.py'))
         self.without_args = factories.generate_script(os.path.join(config.WOOEY_TEST_SCRIPTS, 'without_args.py'))
+        self.subparser_script = factories.generate_script(os.path.join(config.WOOEY_TEST_SCRIPTS, 'subparser_script.py'))
+        self.version1_script = factories.generate_script(
+            os.path.join(config.WOOEY_TEST_SCRIPTS, 'versioned_script', 'v1.py'),
+            script_name='version_test',
+        )
+        self.version2_script = factories.generate_script(
+            os.path.join(config.WOOEY_TEST_SCRIPTS, 'versioned_script', 'v2.py'),
+            script_name='version_test',
+        )
         super(ScriptFactoryMixin, self).setUp()
 
 class FileMixin(object):

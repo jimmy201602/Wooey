@@ -7,6 +7,8 @@ from django.conf.urls.static import static
 from . import views
 from . import settings as wooey_settings
 
+app_name = 'wooey'
+
 wooey_patterns = [
     url(r'^jobs/command$', views.celery_task_command, name='celery_task_command'),
 
@@ -31,8 +33,10 @@ wooey_patterns = [
 
 
     url(r'^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/$', views.WooeyScriptView.as_view(), name='wooey_script'),
-    url(r'^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/version/(?P<script_version>[A-Za-z\.0-9]+)$', views.WooeyScriptView.as_view(), name='wooey_script'),
-    url(r'^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/version/(?P<script_version>[A-Za-z\.0-9]+)/iteration/(?P<script_iteration>\d+)$', views.WooeyScriptView.as_view(), name='wooey_script'),
+    url(r'^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/version/(?P<script_version>[^/]+)$', views.WooeyScriptView.as_view(), name='wooey_script'),
+    url(r'^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/version/(?P<script_version>[^/]+)/iteration/(?P<script_iteration>\d+)$', views.WooeyScriptView.as_view(), name='wooey_script'),
+    url(r'^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/version/(?P<script_version>[^/]+)/jobs/(?P<job_id>[a-zA-Z0-9\-]+)$', views.WooeyScriptView.as_view(), name='wooey_script'),
+    url(r'^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/version/(?P<script_version>[^/]+)/iteration/(?P<script_iteration>\d+)/jobs/(?P<job_id>[a-zA-Z0-9\-]+)$', views.WooeyScriptView.as_view(), name='wooey_script'),
     url(r'^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/jobs/(?P<job_id>[a-zA-Z0-9\-]+)$', views.WooeyScriptView.as_view(), name='wooey_script_clone'),
     url(r'^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/$', views.WooeyScriptJSON.as_view(), name='wooey_script_json'),
 
@@ -58,10 +62,9 @@ wooey_patterns = [
 
 if wooey_settings.WOOEY_REGISTER_URL:
     wooey_patterns += [
-        url('^{}'.format(wooey_settings.WOOEY_REGISTER_URL.lstrip('/')), views.WooeyRegister.as_view(), name='wooey_register'),
+        url(r'^{}'.format(wooey_settings.WOOEY_REGISTER_URL.lstrip('/')), views.WooeyRegister.as_view(), name='wooey_register'),
     ]
 
 urlpatterns = [
-    url('^', include(wooey_patterns, namespace='wooey')),
-    url('^', include('django.contrib.auth.urls')),
+    url(r'^', include(wooey_patterns)),
 ]

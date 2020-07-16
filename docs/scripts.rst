@@ -33,7 +33,7 @@ If you have failing scripts, please open an issue with their contents so
 we can handle cases as they appear and try to make this as
 all-encompasing as possible. One known area which fails currently is
 defining your argparse instance inside the
-``if __name__ == "__main__" block``
+``if __name__ == "__main__"`` block
 
 
 The admin Interface
@@ -71,4 +71,8 @@ within selected groups.
 Scripts and groups may also be shutoff to all users by unchecked the
 'script/group active' option.
 
+Deleting Scripts
+----------------
 
+Scripts may be deleted from the admin interface. When deleting a script,
+all related objects, such as previously run jobs, will also be deleted.

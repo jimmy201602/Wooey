@@ -1,34 +1,27 @@
 from __future__ import absolute_import, print_function, unicode_literals
-__author__ = 'chris'
 import os
-import errno
 import importlib
 import json
 import six
 import uuid
 from io import IOBase
 
-from django.core.files.storage import default_storage
-from django.core.files.base import ContentFile
-from django.db import models
+from autoslug import AutoSlugField
+from celery import states
+from django.db import models, transaction
 from django.conf import settings
+from django.core.cache import caches as django_cache
 from django.core.files.storage import SuspiciousFileOperation
-from django.core.urlresolvers import reverse_lazy, reverse
 from django.contrib.auth.models import Group
 from django.utils.translation import ugettext_lazy as _
 from django.db import transaction
 from django.utils.text import get_valid_filename
+from jsonfield import JSONCharField
 
-from autoslug import AutoSlugField
-
-from celery import states
-
+from ..django_compat import reverse
+from . mixins import UpdateScriptsMixin, ModelDiffMixin, WooeyPy2Mixin
 from .. import settings as wooey_settings
 from .. backend import utils
-from ..django_compat import get_cache
-
-from . mixins import UpdateScriptsMixin, ModelDiffMixin, WooeyPy2Mixin
-from .. import django_compat
 
 # TODO: Handle cases where celery is not setup but specified to be used
 tasks = importlib.import_module(wooey_settings.WOOEY_CELERY_TASKS)
@@ -61,7 +54,7 @@ class Script(ModelDiffMixin, WooeyPy2Mixin, models.Model):
     slug = AutoSlugField(populate_from='script_name', unique=True)
     # we create defaults for the script_group in the clean method of the model. We have to set it to null/blank=True
     # or else we will fail form validation before we hit the model.
-    script_group = models.ForeignKey('ScriptGroup', null=True, blank=True)
+    script_group = models.ForeignKey('ScriptGroup', null=True, blank=True, on_delete=models.CASCADE)
     script_description = models.TextField(blank=True, null=True)
     documentation = models.TextField(blank=True, null=True)
     script_order = models.PositiveSmallIntegerField(default=1)
@@ -107,12 +100,17 @@ class ScriptVersion(ModelDiffMixin, WooeyPy2Mixin, models.Model):
     # parameters, but even a huge site may only have a few thousand parameters to query though.
     script_version = models.CharField(max_length=50, help_text='The script version.', blank=True, default='1')
     script_iteration = models.PositiveSmallIntegerField(default=1)
-    script_path = models.FileField() if django_compat.DJANGO_VERSION >= django_compat.DJ17 else models.FileField(upload_to=wooey_settings.WOOEY_SCRIPT_DIR)
+    script_path = models.FileField()
     default_version = models.BooleanField(default=False)
-    script = models.ForeignKey('Script', related_name='script_version')
+    script = models.ForeignKey('Script', related_name='script_version', on_delete=models.CASCADE)
+    checksum = models.CharField(max_length=40, blank=True)
 
     created_date = models.DateTimeField(auto_now_add=True)
     modified_date = models.DateTimeField(auto_now=True)
+
+    error_messages = {
+        'duplicate_script': _('This script already exists!'),
+    }
 
     class Meta:
         app_label = 'wooey'
@@ -124,6 +122,9 @@ class ScriptVersion(ModelDiffMixin, WooeyPy2Mixin, models.Model):
 
     def get_url(self):
         return reverse('wooey:wooey_script', kwargs={'slug': self.script.slug})
+
+    def get_version_url(self):
+        return reverse('wooey:wooey_script', kwargs={'slug': self.script.slug, 'script_version': self.script_version, 'script_iteration': self.script_iteration})
 
     def get_script_path(self):
         local_storage = utils.get_storage(local=True)
@@ -139,7 +140,7 @@ class WooeyJob(WooeyPy2Mixin, models.Model):
     This model serves to link the submitted celery tasks to a script submitted
     """
     # blank=True, null=True is to allow anonymous users to submit jobs
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, blank=True, null=True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, blank=True, null=True, on_delete=models.SET_NULL)
     celery_id = models.CharField(max_length=255, null=True)
     uuid = models.CharField(max_length=255, default=uuid.uuid4, unique=True)
     job_name = models.CharField(max_length=255)
@@ -147,16 +148,18 @@ class WooeyJob(WooeyPy2Mixin, models.Model):
     stdout = models.TextField(null=True, blank=True)
     stderr = models.TextField(null=True, blank=True)
 
-    DELETED = 'deleted'
-    SUBMITTED = 'submitted'
     COMPLETED = 'completed'
+    DELETED = 'deleted'
+    FAILED = states.FAILURE
     RUNNING = 'running'
+    SUBMITTED = 'submitted'
 
     STATUS_CHOICES = (
-        (SUBMITTED, _('Submitted')),
-        (RUNNING, _('Running')),
         (COMPLETED, _('Completed')),
         (DELETED, _('Deleted')),
+        (FAILED, _('Failed')),
+        (RUNNING, _('Running')),
+        (SUBMITTED, _('Submitted')),
     )
 
     status = models.CharField(max_length=255, default=SUBMITTED, choices=STATUS_CHOICES)
@@ -165,7 +168,11 @@ class WooeyJob(WooeyPy2Mixin, models.Model):
     command = models.TextField()
     created_date = models.DateTimeField(auto_now_add=True)
     modified_date = models.DateTimeField(auto_now=True)
-    script_version = models.ForeignKey('ScriptVersion')
+    script_version = models.ForeignKey('ScriptVersion', on_delete=models.CASCADE)
+
+    error_messages = {
+        'invalid_permissions': _('You are not authenticated to view this job.'),
+    }
 
     class Meta:
         app_label = 'wooey'
@@ -176,14 +183,14 @@ class WooeyJob(WooeyPy2Mixin, models.Model):
         return self.job_name
 
     def get_parameters(self):
-        return ScriptParameters.objects.filter(job=self).order_by('pk')
+        return ScriptParameters.objects.select_related('parameter').filter(job=self).order_by('pk')
 
     def submit_to_celery(self, **kwargs):
         if kwargs.get('resubmit'):
             params = self.get_parameters()
             user = kwargs.get('user')
             self.pk = None
-            self.user = None if user is None or not user.is_authenticated() else user
+            self.user = None if user is None or not user.is_authenticated else user
             # clear the output channels
             self.celery_id = None
             self.uuid = uuid.uuid4()
@@ -203,9 +210,9 @@ class WooeyJob(WooeyPy2Mixin, models.Model):
         if task_kwargs.get('rerun'):
             utils.purge_output(job=self)
         if wooey_settings.WOOEY_CELERY:
-            results = tasks.submit_script.delay(**task_kwargs)
+            transaction.on_commit(lambda: tasks.submit_script.delay(**task_kwargs))
         else:
-            results = tasks.submit_script(**task_kwargs)
+            transaction.on_commit(lambda: tasks.submit_script(**task_kwargs))
         return self
 
     def get_resubmit_url(self):
@@ -244,7 +251,7 @@ class WooeyJob(WooeyPy2Mixin, models.Model):
             self.stderr = stderr
             self.save()
         elif wooey_cache is not None:
-            cache = get_cache(wooey_cache)
+            cache = django_cache[wooey_cache]
             if delete:
                 cache.delete(self.get_realtime_key())
             else:
@@ -253,7 +260,7 @@ class WooeyJob(WooeyPy2Mixin, models.Model):
     def get_realtime(self):
         wooey_cache = wooey_settings.WOOEY_REALTIME_CACHE
         if wooey_cache is not None:
-            cache = get_cache(wooey_cache)
+            cache = django_cache[wooey_cache]
             out = cache.get(self.get_realtime_key())
             if out:
                 return json.loads(out)
@@ -277,7 +284,7 @@ class WooeyJob(WooeyPy2Mixin, models.Model):
 class ScriptParameterGroup(UpdateScriptsMixin, WooeyPy2Mixin, models.Model):
     group_name = models.TextField()
     hidden = models.BooleanField(default=False)
-    script_version = models.ForeignKey('ScriptVersion')
+    script_version = models.ManyToManyField('ScriptVersion')
 
     class Meta:
         app_label = 'wooey'
@@ -285,16 +292,27 @@ class ScriptParameterGroup(UpdateScriptsMixin, WooeyPy2Mixin, models.Model):
         verbose_name_plural = _('script parameter groups')
 
     def __str__(self):
-        return '{}: {}'.format(self.script_version.script.script_name, self.group_name)
+        script_version = self.script_version.first()
+        return '{}: {}'.format(script_version.script.script_name if script_version else 'No Script Assigned', self.group_name)
+
+
+class ScriptParser(WooeyPy2Mixin, models.Model):
+    name = models.CharField(max_length=255, blank=True, default='')
+    script_version = models.ManyToManyField('ScriptVersion')
+
+    def __str__(self):
+        script_version = self.script_version.first()
+        return '{}: {}'.format(script_version.script.script_name if script_version else 'No Script Assigned', self.name)
 
 
 class ScriptParameter(UpdateScriptsMixin, WooeyPy2Mixin, models.Model):
     """
         This holds the parameter mapping for each script, and enforces uniqueness by each script via a FK.
     """
+    parser = models.ForeignKey('ScriptParser', on_delete=models.CASCADE)
     script_version = models.ManyToManyField('ScriptVersion')
     short_param = models.CharField(max_length=255, blank=True)
-    script_param = models.CharField(max_length=255)
+    script_param = models.TextField()
     slug = AutoSlugField(populate_from='script_param', unique=True)
     is_output = models.BooleanField(default=None)
     required = models.BooleanField(default=False)
@@ -305,18 +323,26 @@ class ScriptParameter(UpdateScriptsMixin, WooeyPy2Mixin, models.Model):
         help_text=_('Collapse separate inputs to a given argument to a single input (ie: --arg 1 --arg 2 becomes --arg 1 2)')
     )
     form_field = models.CharField(max_length=255)
-    default = models.CharField(max_length=255, null=True, blank=True)
-    input_type = models.CharField(max_length=255)
-    param_help = models.TextField(verbose_name='help', null=True, blank=True)
+    default = JSONCharField(max_length=255, null=True, blank=True)
+    input_type = models.CharField(
+        max_length=255,
+        help_text=_('The python type expected by the script (e.g. boolean, integer, file).'),
+    )
+    custom_widget = models.ForeignKey('WooeyWidget', null=True, blank=True, on_delete=models.SET_NULL)
+    param_help = models.TextField(verbose_name=_('help'), null=True, blank=True)
     is_checked = models.BooleanField(default=False)
     hidden = models.BooleanField(default=False)
-    parameter_group = models.ForeignKey('ScriptParameterGroup')
-    param_order = models.SmallIntegerField('The order the parameter appears to the user.', default=0)
+    parameter_group = models.ForeignKey('ScriptParameterGroup', on_delete=models.CASCADE)
+    param_order = models.SmallIntegerField(help_text=_('The order the parameter appears to the user.'), default=0)
 
     class Meta:
         app_label = 'wooey'
         verbose_name = _('script parameter')
         verbose_name_plural = _('script parameters')
+
+    @property
+    def form_slug(self):
+        return '{}-{}'.format(self.parser.pk, self.slug)
 
     @property
     def multiple_choice(self):
@@ -356,8 +382,8 @@ class ScriptParameters(WooeyPy2Mixin, models.Model):
         This holds the actual parameters sent with the submission
     """
     # the details of the actual executed scripts
-    job = models.ForeignKey('WooeyJob')
-    parameter = models.ForeignKey('ScriptParameter')
+    job = models.ForeignKey('WooeyJob', on_delete=models.CASCADE)
+    parameter = models.ForeignKey('ScriptParameter', on_delete=models.CASCADE)
     # we store a JSON dumped string in here to attempt to keep our types in order
     _value = models.TextField(db_column='value')
 
@@ -456,8 +482,8 @@ class ScriptParameters(WooeyPy2Mixin, models.Model):
             field = self.parameter.form_field
             if field == self.FILE:
                 try:
-                    file_obj = utils.get_storage_object(value)
-                    value = file_obj
+                    with utils.get_storage_object(value, close=False) as value:
+                        pass
                 except IOError:
                     # this can occur when the storage object is not yet made for output
                     if self.parameter.is_output:
@@ -495,8 +521,8 @@ class ScriptParameters(WooeyPy2Mixin, models.Model):
             else:
                 if value:
                     local_storage = utils.get_storage(local=True)
-                    current_path = local_storage.path(value)
-                    checksum = utils.get_checksum(value)
+                    current_path = local_storage.path(value.name)
+                    checksum = utils.get_checksum(path=value)
                     path = utils.get_upload_path(current_path, checksum=checksum)
                     if hasattr(value, 'size'):
                         filesize = value.size
@@ -525,7 +551,7 @@ class ScriptParameters(WooeyPy2Mixin, models.Model):
             # save ourself first, we have to do this because we are referenced in WooeyFile
             self.save()
             if checksum is None:
-                checksum = utils.get_checksum(local_path)
+                checksum = utils.get_checksum(path=local_path)
             wooey_file, file_created = WooeyFile.objects.get_or_create(checksum=checksum)
             if file_created:
                 wooey_file.filetype = fileinfo.get('type')
@@ -542,9 +568,9 @@ class ScriptParameters(WooeyPy2Mixin, models.Model):
 
 class UserFile(WooeyPy2Mixin, models.Model):
     filename = models.TextField()
-    job = models.ForeignKey('WooeyJob')
-    system_file = models.ForeignKey('WooeyFile')
-    parameter = models.ForeignKey('ScriptParameters', null=True, blank=True)
+    job = models.ForeignKey('WooeyJob', on_delete=models.CASCADE)
+    system_file = models.ForeignKey('WooeyFile', on_delete=models.CASCADE)
+    parameter = models.ForeignKey('ScriptParameters', null=True, blank=True, on_delete=models.CASCADE)
 
     class Meta:
         app_label = 'wooey'
@@ -554,7 +580,7 @@ class UserFile(WooeyPy2Mixin, models.Model):
 
 
 class WooeyFile(WooeyPy2Mixin, models.Model):
-    filepath = models.FileField(max_length=500) if django_compat.DJANGO_VERSION >= django_compat.DJ17 else models.FileField(max_length=500, upload_to=wooey_settings.WOOEY_SCRIPT_DIR)
+    filepath = models.FileField(max_length=500)
     filepreview = models.TextField(null=True, blank=True)
     filetype = models.CharField(max_length=255, null=True, blank=True)
     size_bytes = models.IntegerField(null=True)

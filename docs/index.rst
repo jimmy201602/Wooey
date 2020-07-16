@@ -34,9 +34,14 @@ Getting Started
 
    install
    configuration
-   running
+   running_wooey
    scripts
+   wooey_ui
+   customizations
    remote
+   upgrade_help
+   changelog
+   security
 
 
 Developers

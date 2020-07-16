@@ -1,4 +1,5 @@
-from os import environ
+import errno
+import os
 from .wooey_settings import *
 # This file is where the user can override and customize their installation of wooey
 
@@ -11,17 +12,53 @@ INSTALLED_APPS += (
 WOOEY_ALLOW_ANONYMOUS = True
 
 ## Celery related options
+
 INSTALLED_APPS += (
-    'djcelery',
-    'kombu.transport.django',
+    'django_celery_results',
+    'kombu.transport.filesystem',
 )
 
-CELERY_RESULT_BACKEND='djcelery.backends.database:DatabaseBackend'
-BROKER_URL = 'django://'
+# This stores the results of tasks. For larger sites, a database may become slow and other solutions
+# such as redis should be considered.
+CELERY_RESULT_BACKEND = 'django-db'
+
+# This should absolutely be changed to a non-filesystem based broker for production deployments!
+# http://docs.celeryproject.org/en/latest/getting-started/brokers/
+CELERY_BROKER_URL = 'filesystem://'
+
+# This function exists just to ensure the filesystem has the correct folders
+def ensure_path(path):
+    try:
+        os.makedirs(path)
+    except Exception as e:
+        if e.errno == errno.EEXIST:
+            pass
+        else:
+            raise
+    return path
+
+broker_dir = ensure_path(os.path.join(BASE_DIR, '.broker'))
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    "data_folder_in": ensure_path(os.path.join(broker_dir, "out")),
+    "data_folder_out": ensure_path(os.path.join(broker_dir, "out")),
+    "data_folder_processed": ensure_path(os.path.join(broker_dir, "processed")),
+}
+
+
 CELERY_TRACK_STARTED = True
 WOOEY_CELERY = True
 CELERY_SEND_EVENTS = True
-CELERY_IMPORTS = ('wooey.tasks')
+CELERY_IMPORTS = ('wooey.tasks',)
+
+# A cache interface. This provides realtime updates for scriots and should definitely be changed
+# to use something like redis or memcached in production
+WOOEY_REALTIME_CACHE = 'default'
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': 'wooey_cache_table',
+    }
+}
 
 # Things you most likely do not need to change
 
@@ -51,15 +88,14 @@ STATIC_URL = '/static/'
 #     }
 # }
 
-## A better celery backend -- using RabbitMQ (these defaults are from two free rabbitmq Heroku providers)
-# CELERY_RESULT_BACKEND = 'amqp'
-# BROKER_URL = os.environ.get('AMQP_URL') or \
+## A better celery broker -- using RabbitMQ (these defaults are from two free rabbitmq Heroku providers)
+# CELERY_BROKER_URL = os.environ.get('AMQP_URL') or \
 #              os.environ.get('RABBITMQ_BIGWIG_TX_URL') or \
 #              os.environ.get('CLOUDAMQP_URL', 'amqp://guest:guest@localhost:5672/')
-# BROKER_POOL_LIMIT = 1
+# CELERY_BROKER_POOL_LIMIT = 1
 # CELERYD_CONCURRENCY = 1
 # CELERY_TASK_SERIALIZER = 'json'
-# ACKS_LATE = True
+# CELERY_TASK_ACKS_LATE = True
 #
 
 ## for production environments, django-storages abstracts away much of the difficulty of various storage engines.

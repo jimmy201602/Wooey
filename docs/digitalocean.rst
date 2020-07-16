@@ -30,7 +30,7 @@ You could at this point have Wooey listen to port 80 (assuming it's open) with t
 
     python manage.py runserver 0.0.0.0:80
 
-But this leaves us widly insecure, because all our passwords will be transmitted over HTTP. I had problems working with non-standard ports on UFW so for the purposes of this tutorial, so I set-up my ports using this `iptables linode tutorial
+But this leaves us wildly insecure, because all our passwords will be transmitted over HTTP. I had problems working with non-standard ports on UFW so for the purposes of this tutorial, so I set-up my ports using this `iptables linode tutorial
 <https://www.linode.com/docs/security/firewalls/control-network-traffic-with-iptables>`_.
 
 
@@ -178,7 +178,7 @@ Running Celery in the background
 
 All this other set-up means you then can't use honcho to run celery, because it doesn't seem to like (that's a technical term) the uWSGI command which means instead, you have to run it as a background process. This however just seems to work...
 
-nohup python manage.py celery worker -c 1 --beat -l info & #you probably want to pipe this output somewhere sensible
+nohup celery -A your_project_name worker -c 1 --beat -l info & #you probably want to pipe this output somewhere sensible
 
 Which means you can then run the server with the command above uwsgi command shown above.
 
